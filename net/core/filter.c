@@ -29,6 +29,7 @@
 #include <linux/if_packet.h>
 #include <linux/if_arp.h>
 #include <linux/gfp.h>
+#include <linux/delay.h>
 #include <net/inet_common.h>
 #include <net/ip.h>
 #include <net/protocol.h>
@@ -1698,6 +1699,46 @@ static const struct bpf_func_proto bpf_skb_store_bytes_proto = {
 	.arg5_type	= ARG_ANYTHING,
 };
 
+BPF_CALL_5(bpf_vtl_store_bytes, struct sk_buff *, skb, u32, offset,
+	   const void *, from, u32, len, u64, flags)
+{
+	void *ptr;
+
+	if(len > 0xffff)
+		return -EINVAL;
+
+	if (unlikely(flags & ~(BPF_F_RECOMPUTE_CSUM | BPF_F_INVALIDATE_HASH)))
+		return -EINVAL;
+	if (unlikely(offset > 0xffff))
+		return -EFAULT;
+	if (unlikely(bpf_try_make_writable(skb, offset + len)))
+		return -EFAULT;
+
+	ptr = skb->data + offset;
+	if (flags & BPF_F_RECOMPUTE_CSUM)
+		__skb_postpull_rcsum(skb, ptr, len, offset);
+
+	memcpy(ptr, from, len);
+
+	if (flags & BPF_F_RECOMPUTE_CSUM)
+		__skb_postpush_rcsum(skb, ptr, len, offset);
+	if (flags & BPF_F_INVALIDATE_HASH)
+		skb_clear_hash(skb);
+
+	return 0;
+}
+
+static const struct bpf_func_proto bpf_vtl_store_bytes_proto = {
+	.func		= bpf_vtl_store_bytes,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_ANYTHING,
+	.arg3_type	= ARG_PTR_TO_MEM,
+	.arg4_type	= ARG_CONST_SIZE,
+	.arg5_type	= ARG_ANYTHING,
+};
+
 BPF_CALL_4(bpf_skb_load_bytes, const struct sk_buff *, skb, u32, offset,
 	   void *, to, u32, len)
 {
@@ -2107,6 +2148,44 @@ static int __bpf_redirect(struct sk_buff *skb, struct net_device *dev,
 	else
 		return __bpf_redirect_no_mac(skb, dev, flags);
 }
+
+BPF_CALL_4(bpf_vtl_nic_tx, struct sk_buff *, skb, u32, ifindex,
+						unsigned long long, wait_time, u64, flags) {
+	struct net_device *dev;
+	struct sk_buff* clone;
+	int ret;
+
+	if(unlikely(flags & ~(BPF_F_INGRESS)))
+		return -EINVAL;
+
+	dev = dev_get_by_index_rcu(dev_net(skb->dev), ifindex);
+	if(unlikely(!dev)){
+		return -EINVAL;
+	}
+
+	clone = skb_clone(skb, GFP_KERNEL); // may be GFP_ATOMIC
+	if(unlikely(!clone))
+		return -ENOMEM;
+
+	ret = bpf_try_make_head_writable(skb);
+	if(unlikely(ret)) {
+		kfree_skb(clone);
+		return -ENOMEM;
+	}
+
+	mdelay(wait_time);
+	return __bpf_redirect(clone, dev, flags);
+}
+
+static const struct bpf_func_proto bpf_vtl_nic_tx_proto = {
+	.func 		= bpf_vtl_nic_tx,
+	.gpl_only 	= false,
+	.ret_type 	= RET_INTEGER,
+	.arg1_type 	= ARG_PTR_TO_CTX,
+	.arg2_type 	= ARG_ANYTHING,
+	.arg3_type 	= ARG_ANYTHING,
+	.arg4_type 	= ARG_ANYTHING,
+};
 
 BPF_CALL_3(bpf_clone_redirect, struct sk_buff *, skb, u32, ifindex, u64, flags)
 {
@@ -5857,6 +5936,7 @@ bool bpf_helper_changes_pkt_data(void *func)
 	if (func == bpf_skb_vlan_push ||
 	    func == bpf_skb_vlan_pop ||
 	    func == bpf_skb_store_bytes ||
+	    func == bpf_vtl_store_bytes ||
 	    func == bpf_skb_change_proto ||
 	    func == bpf_skb_change_head ||
 	    func == sk_skb_change_head ||
@@ -5865,6 +5945,7 @@ bool bpf_helper_changes_pkt_data(void *func)
 	    func == bpf_skb_adjust_room ||
 	    func == bpf_skb_pull_data ||
 	    func == sk_skb_pull_data ||
+	    func == bpf_vtl_nic_tx ||
 	    func == bpf_clone_redirect ||
 	    func == bpf_l3_csum_replace ||
 	    func == bpf_l4_csum_replace ||
@@ -5912,6 +5993,8 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 		return &bpf_tail_call_proto;
 	case BPF_FUNC_ktime_get_ns:
 		return &bpf_ktime_get_ns_proto;
+	case BPF_FUNC_vtl_start_timer:
+		return &bpf_vtl_start_timer_proto;
 	default:
 		break;
 	}
@@ -6042,6 +6125,8 @@ tc_cls_act_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	switch (func_id) {
 	case BPF_FUNC_skb_store_bytes:
 		return &bpf_skb_store_bytes_proto;
+	case BPF_FUNC_vtl_store_bytes:
+		return &bpf_vtl_store_bytes_proto;
 	case BPF_FUNC_skb_load_bytes:
 		return &bpf_skb_load_bytes_proto;
 	case BPF_FUNC_skb_load_bytes_relative:
@@ -6056,6 +6141,8 @@ tc_cls_act_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_l3_csum_replace_proto;
 	case BPF_FUNC_l4_csum_replace:
 		return &bpf_l4_csum_replace_proto;
+	case BPF_FUNC_vtl_nic_tx:
+		return &bpf_vtl_nic_tx_proto;
 	case BPF_FUNC_clone_redirect:
 		return &bpf_clone_redirect_proto;
 	case BPF_FUNC_get_cgroup_classid:

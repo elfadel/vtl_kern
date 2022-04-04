@@ -129,6 +129,12 @@ enum {
 
 #define TCP_TX_DELAY		37	/* delay outgoing packets by XX usec */
 
+/* TCP Packet types for VTL control actions */
+#define TCP_SYN 			100
+#define TCP_SYN_ACK 		200
+#define TCP_ACK_SYN 		300 /* ACK of SYN/ACK */
+#define TCP_PURE_ACK		400
+#define TCP_DATA 	        500
 
 #define TCP_REPAIR_ON		1
 #define TCP_REPAIR_OFF		0

@@ -3895,7 +3895,6 @@ void tcp_parse_options(const struct net *net,
 					smc_parse_options(th, opt_rx, ptr,
 							  opsize);
 				break;
-
 			}
 			ptr += opsize-2;
 			length -= opsize;
@@ -5953,7 +5952,8 @@ discard:
 			tcp_drop(sk, skb);
 			return 0;
 		} else {
-			tcp_send_ack(sk);
+			vtl_tcp_send_ack(sk);
+			tcp_call_bpf(sk, 300, 0, NULL);
 		}
 		return -1;
 	}
@@ -6573,6 +6573,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		tcp_reqsk_record_syn(sk, req, skb);
 		fastopen_sk = tcp_try_fastopen(sk, skb, req, &foc, dst);
 	}
+
 	if (fastopen_sk) {
 		af_ops->send_synack(fastopen_sk, dst, &fl, req,
 				    &foc, TCP_SYNACK_FASTOPEN);

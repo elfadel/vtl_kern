@@ -11,6 +11,7 @@
 #include <linux/uidgid.h>
 #include <linux/filter.h>
 #include <linux/ctype.h>
+#include <linux/delay.h>
 
 #include "../../lib/kstrtox.h"
 
@@ -150,6 +151,18 @@ const struct bpf_func_proto bpf_ktime_get_ns_proto = {
 	.func		= bpf_ktime_get_ns,
 	.gpl_only	= true,
 	.ret_type	= RET_INTEGER,
+};
+
+BPF_CALL_1(bpf_vtl_start_timer, unsigned long long, vtl_timer) {
+	// TODO: Set Max
+	msleep(vtl_timer);
+}
+
+const struct bpf_func_proto bpf_vtl_start_timer_proto = {
+	.func 			= bpf_vtl_start_timer,
+	.gpl_only 	= true,
+	.ret_type 	= RET_VOID,
+	.arg1_type 	= ARG_ANYTHING,
 };
 
 BPF_CALL_0(bpf_get_current_pid_tgid)

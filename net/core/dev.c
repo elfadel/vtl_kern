@@ -4433,6 +4433,52 @@ static u32 netif_receive_generic_xdp(struct sk_buff *skb,
 	return act;
 }
 
+void vtl_swap_src_dst_mac(void *data) {
+    unsigned short *p = data;
+    unsigned short dst[3];
+
+    dst[0] = p[0];
+    dst[1] = p[1];
+    dst[2] = p[2];
+    p[0] = p[3];
+    p[1] = p[4];
+    p[2] = p[5];
+    p[3] = dst[0];
+    p[4] = dst[1];
+    p[5] = dst[2];
+}
+
+void generic_vtl_tx(struct sk_buff *skb)
+{
+	struct net_device *dev = skb->dev;
+	struct netdev_queue *txq;
+	bool free_skb = true;
+	int cpu, rc;
+
+	struct ethhdr *eth = (struct ethhdr *)skb_mac_header(skb);
+	struct iphdr *iph = (struct iphdr *)skb_network_header(skb);
+
+	vtl_swap_src_dst_mac(eth);
+
+	__be32 temp_ip = iph->saddr; //Type __be32 warning
+	iph->saddr = iph->daddr;
+	iph->daddr = temp_ip;
+
+	txq = netdev_core_pick_tx(dev, skb, NULL);
+	cpu = smp_processor_id();
+	HARD_TX_LOCK(dev, txq, cpu);
+	if (!netif_xmit_stopped(txq)) {
+		rc = netdev_start_xmit(skb, dev, txq, 0);
+		if (dev_xmit_complete(rc))
+			free_skb = false;
+	}
+	HARD_TX_UNLOCK(dev, txq);
+	if (free_skb) {
+		kfree_skb(skb);
+	}
+}
+EXPORT_SYMBOL_GPL(generic_vtl_tx);
+
 /* When doing generic XDP we have to bypass the qdisc layer and the
  * network taps in order to match in-driver-XDP behavior.
  */
@@ -4465,6 +4511,7 @@ int do_xdp_generic(struct bpf_prog *xdp_prog, struct sk_buff *skb)
 {
 	if (xdp_prog) {
 		struct xdp_buff xdp;
+		struct sk_buff *skb_cpy;
 		u32 act;
 		int err;
 
@@ -4472,6 +4519,11 @@ int do_xdp_generic(struct bpf_prog *xdp_prog, struct sk_buff *skb)
 		if (act != XDP_PASS) {
 			switch (act) {
 			case XDP_REDIRECT:
+				skb_cpy = skb_copy(skb, GFP_ATOMIC);
+				if(unlikely(!skb_cpy)){
+						kfree_skb(skb_cpy);
+				}
+				generic_vtl_tx(skb_cpy);
 				err = xdp_do_generic_redirect(skb->dev, skb,
 							      &xdp, xdp_prog);
 				if (err)

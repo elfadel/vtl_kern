@@ -879,14 +879,11 @@ union bpf_attr {
  *
  * 			int ret;
  * 			struct bpf_tunnel_key key = {};
- * 			
  * 			ret = bpf_skb_get_tunnel_key(skb, &key, sizeof(key), 0);
  * 			if (ret < 0)
  * 				return TC_ACT_SHOT;	// drop packet
- * 			
  * 			if (key.remote_ipv4 != 0x0a000001)
  * 				return TC_ACT_SHOT;	// drop packet
- * 			
  * 			return TC_ACT_OK;		// accept packet
  *
  * 		This interface can also be used with all encapsulation devices
@@ -2721,13 +2718,16 @@ union bpf_attr {
 	FN(map_delete_elem),		\
 	FN(probe_read),			\
 	FN(ktime_get_ns),		\
+	FN(vtl_start_timer), 		\
 	FN(trace_printk),		\
 	FN(get_prandom_u32),		\
 	FN(get_smp_processor_id),	\
 	FN(skb_store_bytes),		\
+	FN(vtl_store_bytes), 		\
 	FN(l3_csum_replace),		\
 	FN(l4_csum_replace),		\
 	FN(tail_call),			\
+	FN(vtl_nic_tx), 		\
 	FN(clone_redirect),		\
 	FN(get_current_pid_tgid),	\
 	FN(get_current_uid_gid),	\
@@ -3323,7 +3323,8 @@ struct bpf_sock_ops {
 #define BPF_SOCK_OPS_RETRANS_CB_FLAG	(1<<1)
 #define BPF_SOCK_OPS_STATE_CB_FLAG	(1<<2)
 #define BPF_SOCK_OPS_RTT_CB_FLAG	(1<<3)
-#define BPF_SOCK_OPS_ALL_CB_FLAGS       0xF		/* Mask of all currently
+#define BPF_SOCK_OPS_VTL_OPT_WRITE_FLAG (1<<4)
+#define BPF_SOCK_OPS_ALL_CB_FLAGS       0x1F		/* Mask of all currently
 							 * supported cb flags
 							 */
 
@@ -3380,6 +3381,8 @@ enum {
 					 */
 	BPF_SOCK_OPS_RTT_CB,		/* Called on every RTT.
 					 */
+
+	BPF_SOCK_OPS_VTL_WRITE_OPT_CB,
 };
 
 /* List of TCP states. There is a build check in net/ipv4/tcp.c to detect

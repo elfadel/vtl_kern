@@ -46,6 +46,8 @@
 
 #include <trace/events/tcp.h>
 
+static int ack_of_synack = -1;
+
 /* Refresh clocks of a TCP socket,
  * ensuring monotically increasing values.
  */
@@ -452,9 +454,11 @@ struct tcp_out_options {
  * (but it may well be that other scenarios fail similarly).
  */
 static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,
-			      struct tcp_out_options *opts)
+			      struct tcp_out_options *opts, u32 tcp_packet_type)
 {
 	u16 options = opts->options;	/* mungable copy */
+	int bpf_ret, v_test_flags;
+	struct sock *sk;
 
 	if (unlikely(OPTION_MD5 & options)) {
 		*ptr++ = htonl((TCPOPT_NOP << 24) | (TCPOPT_NOP << 16) |
@@ -546,6 +550,21 @@ static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 	}
 
 	smc_options_write(ptr, &options);
+
+	v_test_flags = BPF_SOCK_OPS_TEST_FLAG(tp, BPF_SOCK_OPS_VTL_OPT_WRITE_FLAG);
+	if(v_test_flags) {
+		sk = (struct sock *)tp;
+
+		bpf_ret = tcp_call_bpf_2arg(sk, 200/* TODO: BPF_SOCK_OPS_VTL_WRITE_OPT_CB*/, 0, tcp_packet_type);
+
+		if(bpf_ret >= 0) {
+			int len = (bpf_ret << 16) >> 24;
+
+			*(int *)ptr = bpf_ret;
+
+			ptr += len;
+		}
+	}
 }
 
 static void smc_set_option(const struct tcp_sock *tp,
@@ -586,8 +605,7 @@ static void smc_set_option_cond(const struct tcp_sock *tp,
  */
 static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
 				struct tcp_out_options *opts,
-				struct tcp_md5sig_key **md5)
-{
+				struct tcp_md5sig_key **md5){
 	struct tcp_sock *tp = tcp_sk(sk);
 	unsigned int remaining = MAX_TCP_OPTION_SPACE;
 	struct tcp_fastopen_request *fastopen = tp->fastopen_req;
@@ -761,7 +779,6 @@ static unsigned int tcp_established_options(struct sock *sk, struct sk_buff *skb
 
 	return size;
 }
-
 
 /* TCP SMALL QUEUES (TSQ)
  *
@@ -1023,7 +1040,8 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	struct tcp_md5sig_key *md5;
 	struct tcphdr *th;
 	u64 prior_wstamp;
-	int err;
+	int err, extended_len = 0;
+	u32 tcp_packet_type;
 
 	BUG_ON(!skb || !tcp_skb_pcount(skb));
 	tp = tcp_sk(sk);
@@ -1055,6 +1073,20 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	else
 		tcp_options_size = tcp_established_options(sk, skb, &opts,
 							   &md5);
+
+	if(BPF_SOCK_OPS_TEST_FLAG(tp, BPF_SOCK_OPS_VTL_OPT_WRITE_FLAG)) {
+
+		// TODO: Translate below comment
+		// Garde fou pour ne pas augmenter la taille à l'aveugle.
+
+		//TODO: replace 100
+		extended_len = tcp_call_bpf_2arg(sk, 100, 0, tcp_options_size);
+
+		if(extended_len > 0 /*&& (tcp_options_size + extended_len<= 40)*/){
+			tcp_options_size += extended_len;
+		}
+	}
+
 	tcp_header_size = tcp_options_size + sizeof(struct tcphdr);
 
 	/* if no packet is in qdisc/device queue, then allow XPS to select
@@ -1107,7 +1139,26 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 		}
 	}
 
-	tcp_options_write((__be32 *)(th + 1), tp, &opts);
+	/* TCP packet type ! */
+	if(th->syn && !th->ack){
+		tcp_packet_type = TCP_SYN;
+	}
+	else if(th->syn && th->ack) { // Should never hapened but just in case.
+		tcp_packet_type = TCP_SYN_ACK;
+	}
+	else if(!th->syn && th->ack) {
+		if(ack_of_synack == 1) { // This is an ACK of a SYN/ACK
+			tcp_packet_type = TCP_ACK_SYN;
+			ack_of_synack = -1; // Reinit !
+		}
+		else
+			tcp_packet_type = TCP_PURE_ACK;
+	}
+	else {
+		tcp_packet_type = TCP_DATA;
+	}
+
+	tcp_options_write((__be32 *)(th + 1), tp, &opts, tcp_packet_type);
 	skb_shinfo(skb)->gso_type = sk->sk_gso_type;
 	if (likely(!(tcb->tcp_flags & TCPHDR_SYN))) {
 		th->window      = htons(tcp_select_window(sk));
@@ -1577,8 +1628,10 @@ unsigned int tcp_current_mss(struct sock *sk)
 	const struct dst_entry *dst = __sk_dst_get(sk);
 	u32 mss_now;
 	unsigned int header_len;
+	unsigned int opt_len;
 	struct tcp_out_options opts;
 	struct tcp_md5sig_key *md5;
+	int extended_len = 0;
 
 	mss_now = tp->mss_cache;
 
@@ -1588,8 +1641,17 @@ unsigned int tcp_current_mss(struct sock *sk)
 			mss_now = tcp_sync_mss(sk, mtu);
 	}
 
-	header_len = tcp_established_options(sk, NULL, &opts, &md5) +
-		     sizeof(struct tcphdr);
+	opt_len = tcp_established_options(sk, NULL, &opts, &md5);
+
+	if(BPF_SOCK_OPS_TEST_FLAG(tp, BPF_SOCK_OPS_VTL_OPT_WRITE_FLAG)) {
+		extended_len = tcp_call_bpf_2arg(sk, 100, 0, opt_len);
+
+		if(extended_len > 0 /*&& (tcp_options_size + extended_len<= 40)*/){
+			opt_len += extended_len;
+		}
+	}
+
+	header_len = opt_len + sizeof(struct tcphdr);
 	/* The mss_cache is sized based on tp->tcp_header_len, which assumes
 	 * some common options. If this is an odd packet (because we have SACK
 	 * blocks etc) then our calculated header_len will be different, and
@@ -1813,7 +1875,6 @@ static int tcp_init_tso_segs(struct sk_buff *skb, unsigned int mss_now)
 	}
 	return tso_segs;
 }
-
 
 /* Return true if the Nagle test allows this packet to be
  * sent now.
@@ -3238,6 +3299,8 @@ struct sk_buff *tcp_make_synack(const struct sock *sk, struct dst_entry *dst,
 {
 	struct inet_request_sock *ireq = inet_rsk(req);
 	const struct tcp_sock *tp = tcp_sk(sk);
+	struct sock *copy_sk;
+	int extended_len, tcp_options_size;
 	struct tcp_md5sig_key *md5 = NULL;
 	struct tcp_out_options opts;
 	struct sk_buff *skb;
@@ -3293,8 +3356,20 @@ struct sk_buff *tcp_make_synack(const struct sock *sk, struct dst_entry *dst,
 	md5 = tcp_rsk(req)->af_specific->req_md5_lookup(sk, req_to_sk(req));
 #endif
 	skb_set_hash(skb, tcp_rsk(req)->txhash, PKT_HASH_TYPE_L4);
-	tcp_header_size = tcp_synack_options(sk, req, mss, skb, &opts, md5,
-					     foc) + sizeof(*th);
+
+	tcp_options_size = tcp_synack_options(sk, req, mss, skb, &opts, md5,
+					     foc);
+
+	if(BPF_SOCK_OPS_TEST_FLAG(tp, BPF_SOCK_OPS_VTL_OPT_WRITE_FLAG)) {
+		copy_sk = (struct sock *) sk;
+		extended_len = tcp_call_bpf_2arg(copy_sk, 100, 0, tcp_options_size);
+
+		if(extended_len > 0) {
+			tcp_options_size += extended_len;
+		}
+	}
+
+	tcp_header_size = tcp_options_size + sizeof(*th);
 
 	skb_push(skb, tcp_header_size);
 	skb_reset_transport_header(skb);
@@ -3314,7 +3389,7 @@ struct sk_buff *tcp_make_synack(const struct sock *sk, struct dst_entry *dst,
 
 	/* RFC1323: The window in SYN & SYN/ACK segments is never scaled. */
 	th->window = htons(min(req->rsk_rcv_wnd, 65535U));
-	tcp_options_write((__be32 *)(th + 1), NULL, &opts);
+	tcp_options_write((__be32 *)(th + 1), (struct tcp_sock *)tp, &opts, TCP_SYN_ACK);
 	th->doff = (tcp_header_size >> 2);
 	__TCP_INC_STATS(sock_net(sk), TCP_MIB_OUTSEGS);
 
@@ -3688,6 +3763,11 @@ EXPORT_SYMBOL_GPL(__tcp_send_ack);
 
 void tcp_send_ack(struct sock *sk)
 {
+	__tcp_send_ack(sk, tcp_sk(sk)->rcv_nxt);
+}
+
+void vtl_tcp_send_ack(struct sock *sk) {
+	ack_of_synack = 1;
 	__tcp_send_ack(sk, tcp_sk(sk)->rcv_nxt);
 }
 
